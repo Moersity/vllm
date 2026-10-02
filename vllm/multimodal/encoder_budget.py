@@ -79,63 +79,59 @@ class MultiModalBudget:
                 if mm_limits.get(modality, 0) > 0
             }
             # Modalities that bypass the tower (pre-computed embeddings only)
-            embed_only_modalities = {
+            self.embed_only_modalities = {
                 modality
                 for modality in supported_mm_limits
                 if enable_mm_embeds and mm_limits.get(modality, 0) == 0
             }
 
-            active_modalities = tower_modalities | embed_only_modalities
-
-            all_mm_max_toks_per_item = get_mm_max_toks_per_item(
-                processor,
-                cache=cache,
-                mm_counts=dict.fromkeys(active_modalities, 1),
-            )
-
-        if embed_only_modalities:
-            logger.info_once(
-                "enable_mm_embeds is True; modalities handled as embedding-only: %s",
-                tuple(embed_only_modalities),
+            all_mm_max_toks_per_item = (
+                get_mm_max_toks_per_item(
+                    processor,
+                    cache=cache,
+                    mm_counts=dict.fromkeys(tower_modalities, 1),
+                )
+                if tower_modalities
+                else {}
             )
 
         # Some models (e.g., Qwen3Omni with use_audio_in_video=True) share
-        # placeholders between modalities, so not all active modalities will
+        # placeholders between modalities, so not all tower modalities will
         # have their own entry in the returned dict. We filter to only include
         # modalities that have independent placeholder tokens.
-        active_mm_max_toks_per_item = {
+        self.mm_max_toks_per_item = {
             modality: all_mm_max_toks_per_item[modality]
-            for modality in active_modalities
+            for modality in tower_modalities
             if modality in all_mm_max_toks_per_item
         }
-        tower_mm_max_toks_per_item = {
-            modality: active_mm_max_toks_per_item[modality]
-            for modality in tower_modalities
-            if modality in active_mm_max_toks_per_item
-        }
 
-        # Encoder budget is computed from all active modalities (including
-        # embedding-only ones that need encoder cache space).
-        encoder_compute_budget, encoder_cache_size = compute_mm_encoder_budget(
-            scheduler_config,
-            active_mm_max_toks_per_item,
+        # Precomputed embeddings use the bounded cache without reserving the
+        # worst-case encoder output of disabled modalities.
+        self.encoder_compute_budget, self.encoder_cache_size = (
+            compute_mm_encoder_budget(
+                scheduler_config,
+                self.mm_max_toks_per_item,
+                enable_mm_embeds=enable_mm_embeds,
+            )
         )
 
-        self.encoder_compute_budget = encoder_compute_budget
-        self.encoder_cache_size = encoder_cache_size
+        if self.embed_only_modalities:
+            logger.info_once(
+                "enable_mm_embeds is True; embedding-only modalities %s share "
+                "the encoder cache budget of %s tokens without increasing it.",
+                tuple(sorted(self.embed_only_modalities)),
+                self.encoder_cache_size,
+            )
 
         mm_max_items_per_prompt = dict[str, int]()
         mm_max_items_per_batch = dict[str, int]()
 
-        # Per-prompt/per-batch limits are only relevant for tower modalities
-        # (embedding-only modalities don't go through the encoder tower).
-        for modality, max_toks_per_item in tower_mm_max_toks_per_item.items():
+        for modality, max_toks_per_item in self.mm_max_toks_per_item.items():
             (
                 mm_max_items_per_prompt[modality],
                 mm_max_items_per_batch[modality],
             ) = self._get_max_items(modality, max_toks_per_item)
 
-        self.mm_max_toks_per_item = tower_mm_max_toks_per_item
         self.mm_max_items_per_prompt: Mapping[str, int] = mm_max_items_per_prompt
         self.mm_max_items_per_batch: Mapping[str, int] = mm_max_items_per_batch
 
@@ -189,6 +185,17 @@ class MultiModalBudget:
 
     def get_encoder_budget(self) -> int:
         return min(self.encoder_compute_budget, self.encoder_cache_size)
+
+    def get_encoder_cache_profile_padding(self) -> int:
+        """Cache tokens not covered by the dummy encoder outputs."""
+        profile_tokens = 0
+        if self.get_encoder_budget() > 0 and self.mm_max_toks_per_item:
+            modality = self.get_modality_with_max_tokens()
+            profile_tokens = (
+                self.mm_max_toks_per_item[modality]
+                * self.mm_max_items_per_batch[modality]
+            )
+        return max(0, self.encoder_cache_size - profile_tokens)
 
     def get_dummy_encoder_profile_inputs(
         self,

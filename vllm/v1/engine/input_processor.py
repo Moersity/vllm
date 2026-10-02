@@ -589,7 +589,7 @@ class InputProcessor:
                             f"pre-allocated encoder cache size "
                             f"{self.mm_encoder_cache_size}. Please reduce the input "
                             f"size or increase the encoder cache size "
-                            f"by setting --limit-mm-per-prompt at startup."
+                            f"by increasing --max-num-batched-tokens at startup."
                         )
 
         # Shared by generate, embedding and pooling requests.

@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from unittest.mock import Mock
+
 import pytest
 import torch
 
+from vllm.config import SchedulerConfig
+from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
@@ -10,6 +14,62 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize(
+    "limits,enable_embeds,batch_tokens,compute,cache,images,padding",
+    [
+        ({"image": 1, "video": 0}, True, 8192, 8192, 8192, 1, 3008),
+        ({"image": 1, "video": 0}, False, 8192, 8192, 8192, 1, 3008),
+        ({"image": 1, "video": 1}, True, 8192, 1047168, 1047168, 202, 0),
+        ({"image": 0, "video": 0}, True, 8192, 0, 8192, 0, 8192),
+        ({"image": 0, "video": 0}, False, 8192, 0, 0, 0, 0),
+        ({"image": 3, "video": 0}, True, 1024, 5184, 5184, 1, 0),
+        ({"image": 3, "video": 0}, True, 16384, 16384, 16384, 3, 832),
+    ],
+)
+def test_disabled_video_does_not_inflate_compute_or_cache_budget(
+    limits, enable_embeds, batch_tokens, compute, cache, images, padding
+):
+    """Disabled video must not reserve its worst-case output or encode 202 images."""
+    config = Mock()
+    config.model_config.max_model_len = 2097152
+    config.model_config.get_multimodal_config.return_value.enable_mm_embeds = (
+        enable_embeds
+    )
+    config.scheduler_config = SchedulerConfig(
+        max_num_batched_tokens=batch_tokens,
+        max_num_seqs=256,
+        max_model_len=2097152,
+        enable_chunked_prefill=True,
+        is_encoder_decoder=False,
+    )
+    registry = Mock()
+    processor = registry.create_processor.return_value
+    processor.info.supported_mm_limits = {"image": None, "video": None}
+    processor.info.allowed_mm_limits = limits
+    processor.info.get_mm_max_tokens_per_item.return_value = {
+        "image": 5184,
+        "video": 1047168,
+    }
+    processor.get_dummy_mm_inputs.return_value = {"mm_kwargs": {"image": [Mock()]}}
+
+    budget = MultiModalBudget(config, registry, enable_cache=False)
+
+    assert budget.encoder_compute_budget == compute
+    assert budget.encoder_cache_size == cache
+    assert budget.mm_max_items_per_batch.get("image", 0) == images
+    if compute:
+        assert processor.info.get_mm_max_tokens_per_item.call_args.kwargs[
+            "mm_counts"
+        ] == {modality: 1 for modality, limit in limits.items() if limit}
+    else:
+        processor.info.get_mm_max_tokens_per_item.assert_not_called()
+    if images:
+        assert len(budget.get_dummy_encoder_profile_inputs("image")) == images
+    else:
+        assert budget.get_dummy_encoder_profile_inputs() == []
+    assert budget.get_encoder_cache_profile_padding() == padding
 
 
 # ------------------ Mock Classes ------------------ #

@@ -265,6 +265,9 @@ class Scheduler(SchedulerInterface):
         self.max_num_encoder_input_tokens = (
             mm_budget.encoder_compute_budget if mm_budget else 0
         )
+        self.embed_only_modalities = (
+            mm_budget.embed_only_modalities if mm_budget else set()
+        )
         encoder_cache_size = mm_budget.encoder_cache_size if mm_budget else 0
         manager_cls_obj = vllm_config.ec_manager_config.get_encoder_cache_manager_obj()
         if manager_cls_obj is None:
@@ -807,7 +810,7 @@ class Scheduler(SchedulerInterface):
                                 # Restore encoder compute budget if the preempted
                                 # request had encoder inputs scheduled in this step.
                                 num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
+                                    self._get_encoder_compute_tokens(preempted_req, i)
                                     for i in preempted_encoder_inputs
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
@@ -1756,6 +1759,11 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_mismatch_reqs.add(request.request_id)
         return True
 
+    def _get_encoder_compute_tokens(self, request: Request, input_id: int) -> int:
+        if request.mm_features[input_id].modality in self.embed_only_modalities:
+            return 0
+        return request.get_num_encoder_embeds(input_id)
+
     def _try_schedule_encoder_inputs(
         self,
         request: Request,
@@ -1886,8 +1894,19 @@ class Scheduler(SchedulerInterface):
                     0, start_pos - (num_computed_tokens + shift_computed_tokens)
                 )
                 break
+            load_external = (
+                self.ec_connector is not None
+                and self.ec_connector.has_cache_item(item_identifier)
+            )
+            compute_tokens = (
+                0 if load_external else self._get_encoder_compute_tokens(request, i)
+            )
+            # Precomputed embeddings require cache capacity, not tower compute.
             if not self.encoder_cache_manager.can_allocate(
-                request, i, encoder_compute_budget, num_embeds_to_schedule
+                request,
+                i,
+                encoder_compute_budget if compute_tokens else num_encoder_embeds,
+                num_embeds_to_schedule,
             ):
                 # The encoder cache is full or the encoder budget is exhausted.
                 # NOTE(woosuk): We assume that the encoder input tokens should
@@ -1921,16 +1940,14 @@ class Scheduler(SchedulerInterface):
             if curr_embeds_end - curr_embeds_start == 0:
                 continue
 
-            if self.ec_connector is not None and self.ec_connector.has_cache_item(
-                item_identifier
-            ):
+            if load_external:
                 mm_hashes_to_schedule[item_identifier] = num_encoder_embeds
                 external_load_encoder_input.append(i)
                 num_embeds_to_schedule += num_encoder_embeds
                 continue
 
             num_embeds_to_schedule += num_encoder_embeds
-            encoder_compute_budget -= num_encoder_embeds
+            encoder_compute_budget -= compute_tokens
             mm_hashes_to_schedule[item_identifier] = num_encoder_embeds
             encoder_inputs_to_schedule.append(i)
 

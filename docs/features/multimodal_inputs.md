@@ -473,6 +473,15 @@ The exact shape depends on the model being used.
 
 You must enable this feature via `enable_mm_embeds=True`.
 
+With this flag enabled, setting a modality's `limit_mm_per_prompt` to `0`
+disables its encoder inputs but still accepts pre-computed embeddings.
+Embedding-only modalities do not increase the encoder compute or cache budget
+based on their theoretical maximum input size. They share the encoder cache
+sized from `max_num_batched_tokens` and the largest enabled encoder input.
+Each embedding item must fit in that cache; increase `max_num_batched_tokens`
+if an item exceeds its capacity. If all modality limits are `0`, no encoder is
+profiled, but embedding cache storage is still included in memory profiling.
+
 !!! warning
     The vLLM engine may crash if incorrect shape of embeddings is passed.
     Only enable this flag for trusted users!

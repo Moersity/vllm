@@ -316,6 +316,8 @@ class EncoderCacheManager:
 def compute_mm_encoder_budget(
     scheduler_config: "SchedulerConfig",
     mm_max_toks_per_item: Mapping[str, int],
+    *,
+    enable_mm_embeds: bool = False,
 ) -> tuple[int, int]:
     """Compute the encoder cache budget based on the model and scheduler
     configurations for a multimodal model.
@@ -323,7 +325,9 @@ def compute_mm_encoder_budget(
     Args:
         scheduler_config: Scheduler configuration.
         mm_max_toks_per_item: The maximum number of tokens per item for each
-            non-text modality.
+            modality that executes the encoder.
+        enable_mm_embeds: Keep the scheduler's base cache capacity even when
+            all encoders are disabled. Precomputed embeddings must fit this cache.
 
     Returns:
         - Compute budget for encoder execution, measured in number of tokens
@@ -333,6 +337,8 @@ def compute_mm_encoder_budget(
 
     """
     if not mm_max_toks_per_item:
+        if enable_mm_embeds:
+            return 0, scheduler_config.encoder_cache_size
         logger.warning(
             "All non-text modalities supported by the model have been "
             "explicitly disabled via limit_mm_per_prompt. Encoder cache will "

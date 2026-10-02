@@ -18,6 +18,7 @@ import torch
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
+from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalFieldElem,
@@ -32,6 +33,30 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 pytestmark = pytest.mark.cpu_test
 
 HIDDEN = 4
+
+
+@pytest.mark.parametrize("compute_budget", [0, 8])
+def test_profile_reserves_embedding_cache_without_extra_encoder_items(compute_budget):
+    """Cache storage must coexist with the smaller encoder forward allocation."""
+    budget = MultiModalBudget.__new__(MultiModalBudget)
+    budget.encoder_compute_budget = compute_budget
+    budget.encoder_cache_size = 64
+    budget.mm_max_toks_per_item = {"image": 4} if compute_budget else {}
+    budget.mm_max_items_per_batch = {"image": 2} if compute_budget else {}
+    runner = _make_runner([], [])
+    dummy_inputs = [("image", MagicMock())] * (2 if compute_budget else 0)
+
+    def encode(inputs):
+        assert inputs == dummy_inputs
+        padding = runner.encoder_cache.encoder_outputs["tmp_cache_padding"]
+        assert padding.shape == (64 - compute_budget, HIDDEN)
+        return [torch.zeros(4, HIDDEN) for _ in inputs]
+
+    runner.execute_mm_encoder = MagicMock(side_effect=encode)
+    runner.profile_encoder_cache(dummy_inputs, budget)
+
+    assert sum(t.shape[0] for t in runner.encoder_cache.encoder_outputs.values()) == 64
+    assert runner.execute_mm_encoder.call_count == bool(compute_budget)
 
 
 @pytest.mark.parametrize(

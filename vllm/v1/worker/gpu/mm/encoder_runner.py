@@ -114,14 +114,17 @@ class EncoderRunner:
         budget: MultiModalBudget,
     ) -> None:
         """Profile multimodal encoder and temporary encoder cache memory."""
-        if (encoder_budget := budget.get_encoder_budget()) <= 0:
-            return
-
-        if not budget.mm_max_toks_per_item:
-            logger.info(
-                "Skipping encoder profiling for embedding-only mode "
-                "(all modality limits=0 with enable_mm_embeds=True).",
+        cache_padding = budget.get_encoder_cache_profile_padding()
+        if cache_padding > 0:
+            # Reserve storage before the forward to include it in the peak.
+            self.encoder_cache.encoder_outputs["tmp_cache_padding"] = torch.empty(
+                cache_padding,
+                self.hidden_size,
+                dtype=self.dtype,
+                device=self.device,
             )
+
+        if (encoder_budget := budget.get_encoder_budget()) <= 0:
             return
 
         assert dummy_mm_inputs, "Dummy inputs should be generated for encoder profiling"
@@ -129,9 +132,10 @@ class EncoderRunner:
         max_mm_items_per_batch = len(dummy_mm_inputs)
 
         logger.info_once(
-            "Encoder cache will be initialized with a budget of %s tokens, "
-            "and profiled with %s %s items of the maximum feature size.",
+            "Encoder compute budget is %s tokens; encoder cache budget is %s "
+            "tokens. Profiling with %s %s items of the maximum feature size.",
             encoder_budget,
+            budget.encoder_cache_size,
             max_mm_items_per_batch,
             dummy_modality,
         )
