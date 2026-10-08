@@ -1,15 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch.cuda
 
 from vllm import LLM, SamplingParams
+from vllm.exceptions import VLLMValidationError
+from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core import EngineCore
+from vllm.v1.engine.input_processor import InputProcessor
 
 MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("num_embeds", [8192, 8193])
+def test_precomputed_embedding_must_fit_bounded_encoder_cache(num_embeds):
+    """Reject oversized embeddings before they can stall the scheduler."""
+    processor = InputProcessor.__new__(InputProcessor)
+    processor.model_config = SimpleNamespace(
+        max_model_len=32768, runner_type="generate"
+    )
+    processor.renderer = Mock(tokenizer=None)
+    processor.mm_encoder_cache_size = 8192
+    processor.skip_prompt_length_check = False
+    prompt = {
+        "type": "multimodal",
+        "prompt_token_ids": [0] * num_embeds,
+        "mm_placeholders": {"video": [PlaceholderRange(offset=0, length=num_embeds)]},
+    }
+    if num_embeds <= processor.mm_encoder_cache_size:
+        processor._validate_model_input(prompt, "decoder")
+    else:
+        with pytest.raises(VLLMValidationError, match="--max-num-batched-tokens"):
+            processor._validate_model_input(prompt, "decoder")
 
 
 def test_preprocess_error_handling(monkeypatch: pytest.MonkeyPatch):

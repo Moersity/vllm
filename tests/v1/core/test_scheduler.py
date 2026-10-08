@@ -38,7 +38,10 @@ from vllm.multimodal.inputs import (
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
-from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
+from vllm.v1.core.encoder_cache_manager import (
+    EncoderCacheManager,
+    compute_mm_encoder_budget,
+)
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
@@ -319,6 +322,50 @@ def test_scheduler_stats_route_to_existing_output_client():
     assert 0 not in engine_core_outputs
     assert engine_core_outputs[1].scheduler_stats is not None
     assert len(engine_core_outputs[1].outputs) == 1
+
+
+@pytest.mark.parametrize("batch_tokens", [8, 16, 32])
+def test_multiple_images_progress_with_bounded_encoder_cache(batch_tokens):
+    """Images exceeding the combined cache capacity must finish across steps."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=batch_tokens, max_num_seqs=1, max_model_len=128
+    )
+    scheduler.embed_only_modalities = {"video"}
+    compute_budget, cache_size = compute_mm_encoder_budget(
+        scheduler.scheduler_config, {"image": 12}, enable_mm_embeds=True
+    )
+    scheduler.max_num_encoder_input_tokens = compute_budget
+    scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=cache_size)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=37,
+        mm_positions=[[PlaceholderRange(offset=12 * i, length=12) for i in range(3)]],
+    )[0]
+    scheduler.add_request(request)
+    encoded_images = []
+
+    for _ in range(request.num_prompt_tokens):
+        if request.num_computed_tokens == request.num_prompt_tokens:
+            break
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens.get(request.request_id, 0) > 0
+        inputs = output.scheduled_encoder_inputs.get(request.request_id, [])
+        assert 12 * len(inputs) <= compute_budget
+        encoded_images.extend(inputs)
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    assert request.num_computed_tokens == request.num_prompt_tokens
+    assert encoded_images == [0, 1, 2]
 
 
 def test_schedule_multimodal_requests():
@@ -4443,6 +4490,58 @@ def test_scheduler_no_ec_connector_by_default():
     """Test scheduler doesn't have EC connector by default."""
     scheduler = create_scheduler()
     assert scheduler.ec_connector is None
+
+
+@pytest.mark.parametrize("cache_size,expected_inputs", [(16, [0, 1]), (12, [0])])
+def test_embedding_only_input_leaves_compute_for_image(cache_size, expected_inputs):
+    """Embedding storage is cache-limited and does not consume tower compute."""
+    scheduler = create_scheduler(max_num_batched_tokens=32)
+    scheduler.embed_only_modalities = {"video"}
+    scheduler.max_num_encoder_input_tokens = 4
+    scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=cache_size)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=20,
+        mm_positions=[
+            [
+                PlaceholderRange(offset=0, length=12),
+                PlaceholderRange(offset=12, length=4),
+            ]
+        ],
+    )[0]
+    request.mm_features[0].modality = "video"
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.scheduled_encoder_inputs[request.request_id] == expected_inputs
+    assert output.num_scheduled_tokens[request.request_id] == (
+        20 if cache_size == 16 else 12
+    )
+
+
+@pytest.mark.parametrize("cache_size", [8, 16])
+def test_precomputed_embeddings_schedule_without_encoder_budget(cache_size):
+    """Zero tower budget must allow embeddings, while cache capacity still applies."""
+    scheduler = create_scheduler(max_num_batched_tokens=32)
+    scheduler.embed_only_modalities = {"video"}
+    scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=cache_size)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=20,
+        mm_positions=[[PlaceholderRange(offset=0, length=12)]],
+    )[0]
+    request.mm_features[0].modality = "video"
+
+    inputs, tokens, compute, loads, duplicates = scheduler._try_schedule_encoder_inputs(
+        request, num_computed_tokens=0, num_new_tokens=4, encoder_compute_budget=0
+    )
+
+    assert compute == 0
+    assert tokens == (4 if cache_size == 16 else 0)
+    assert inputs == ([0] if cache_size == 16 else [])
+    assert loads == []
+    assert duplicates == []
 
 
 def test_mamba_align_encoder_cache_cap_makes_progress():

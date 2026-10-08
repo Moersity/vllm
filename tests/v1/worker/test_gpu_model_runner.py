@@ -29,6 +29,7 @@ from vllm.lora.layers import LoRAMappingType
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.platforms.interface import Platform
@@ -68,6 +69,51 @@ from vllm.v1.worker.utils import select_common_block_size
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("compute_budget,skip", [(0, False), (8, False), (8, True)])
+def test_profile_mm_cache_with_separate_compute_budget(
+    monkeypatch, compute_budget, skip
+):
+    """Profile cache storage alongside encoder/decoder work, including embeds only."""
+    budget = MultiModalBudget.__new__(MultiModalBudget)
+    budget.encoder_compute_budget = compute_budget
+    budget.encoder_cache_size = 64
+    budget.mm_max_toks_per_item = {"image": 4} if compute_budget else {}
+    budget.mm_max_items_per_batch = {"image": 2} if compute_budget else {}
+    runner = Mock()
+    runner.supports_mm_inputs = True
+    runner.model_config.multimodal_config.skip_mm_profiling = skip
+    runner.mm_budget = budget
+    runner.encoder_cache = {}
+    runner.inputs_embeds_size = 4
+    runner.dtype = torch.float32
+    runner.device = torch.device("cpu")
+    runner._get_mm_dummy_batch.return_value = {}
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=False),
+    )
+
+    def encode(**kwargs):
+        assert runner.encoder_cache["tmp_cache_padding"].shape == (56, 4)
+        return [torch.zeros(4, 4), torch.zeros(4, 4)]
+
+    def decode(*args, **kwargs):
+        assert sum(t.shape[0] for t in runner.encoder_cache.values()) == (
+            0 if skip else 64
+        )
+        return None, None
+
+    runner.model.embed_multimodal.side_effect = encode
+    runner._dummy_run.side_effect = decode
+
+    GPUModelRunner.profile_run(runner)
+
+    assert runner.model.embed_multimodal.call_count == bool(compute_budget and not skip)
+    assert runner.encoder_cache == {}
 
 
 @pytest.fixture(autouse=True)
